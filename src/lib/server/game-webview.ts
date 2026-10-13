@@ -2,28 +2,41 @@
 
 import { randomUUID } from 'node:crypto';
 import { and, eq, lt } from 'drizzle-orm';
-import { env } from '$env/dynamic/private';
 import { db } from '$lib/server/db';
-import {
-	gameWebServiceTokens,
-	gameWebviewSessions,
-	type WebviewCookie
-} from '$lib/server/db/schema';
+import { gameWebServiceTokens, gameWebviewSessions } from '$lib/server/db/schema';
 import { buildWebviewHtml } from '$lib/server/standalone-webview';
 import {
 	NOOKLINK_API_ORIGIN,
 	NOOKLINK_DPL_ORIGIN,
 	SMASH_WORLD_CDN_ORIGIN,
 	SPLATNET3_API_ORIGIN,
-	TRUSTED_NINTENDO_DOMAINS
+	isStrictNintendoOrigin,
+	isOriginWhitelisted
 } from '$lib/server/webviewDomains';
 import type { GameService, GameServiceSession } from '$lib/types/game-services';
+import {
+	isZeldaNotes,
+	isNookLink,
+	isSmashWorld,
+	isSplatNet2,
+	patchZeldaNotesJavascript,
+	rewriteNookLinkApiOrigin
+} from './game-service-compat';
+import {
+	createUpstreamHeaders,
+	createZeldaBootstrapHeaders,
+	createSplatNet2BootstrapHeaders
+} from './game-webview-headers';
+import { CookieJar } from './webview-cookie-jar';
+import { gameWebviewLaunchPath } from './game-webview-routing';
+import {
+	gameAssetCacheControl,
+	reusableGameAsset,
+	immutableGameAsset
+} from './game-webview-assets';
 
 const SESSION_LIFETIME = 2 * 60 * 60 * 1000;
 const SPLATNET3_ID = 4834290508791808;
-const NOOKLINK_ID = 4953919198265344;
-const SMASH_WORLD_IDS = new Set([5598642853249024, 5614999764533248]);
-const ZELDA_NOTES_IDS = new Set([5935781783175168, 4974384874151936]);
 const cookieWrites = new Map<string, Promise<void>>();
 
 type GameWebviewSession = typeof gameWebviewSessions.$inferSelect;
@@ -32,7 +45,8 @@ export async function createGameWebviewSession(
 	accountId: string,
 	service: GameService,
 	language: string,
-	country: string
+	country: string,
+	gameWebToken: string
 ): Promise<GameServiceSession> {
 	const initialUrl = new URL(service.uri);
 	if (!isStrictNintendoUrl(initialUrl)) throw new Error('Nintendo service URL is not allowed');
@@ -40,29 +54,81 @@ export async function createGameWebviewSession(
 	const id = randomUUID();
 	const expiresAt = new Date(Date.now() + SESSION_LIFETIME);
 	const allowedOrigins = resolveAllowedOrigins(service);
-	if (ZELDA_NOTES_IDS.has(service.id) && initialUrl.pathname === '/') {
-		initialUrl.pathname = '/title-select';
+	if (!initialUrl.searchParams.has('lang')) initialUrl.searchParams.set('lang', language);
+	if (!initialUrl.searchParams.has('na_lang')) initialUrl.searchParams.set('na_lang', language);
+	if (!initialUrl.searchParams.has('na_country'))
+		initialUrl.searchParams.set('na_country', country);
+	const browserService =
+		isNookLink({ serviceId: service.id, serviceUri: service.uri }) ||
+		isSmashWorld({ serviceId: service.id, serviceUri: service.uri }) ||
+		isSplatNet2({ serviceId: service.id, serviceUri: service.uri });
+	const serviceUri = browserService ? service.uri : initialUrl.toString();
+	const cookieJar = new CookieJar([]);
+	if (isSplatNet2({ serviceId: service.id, serviceUri })) {
+		// The extension prewarms authentication, installs its cookies and opens
+		// /home explicitly. Do not depend on the bootstrap page navigating itself.
+		try {
+			const bootstrap = await fetch(initialUrl.toString(), {
+				headers: createSplatNet2BootstrapHeaders(gameWebToken, language, country),
+				redirect: 'follow'
+			});
+			for (const value of getSetCookies(bootstrap.headers)) {
+				cookieJar.addSetCookie(value, initialUrl);
+				if (bootstrap.url) cookieJar.addSetCookie(value, new URL(bootstrap.url));
+			}
+			await bootstrap.body?.cancel();
+		} catch (cause) {
+			console.warn(
+				'[GameWebviewProxy] SplatNet 2 prewarm failed',
+				cause instanceof Error ? cause.message : String(cause)
+			);
+		}
+		initialUrl.pathname = '/home';
+	} else if (isZeldaNotes({ serviceId: service.id, serviceUri })) {
+		// Authenticate the exact launch URI before opening the title selector, as
+		// nso-worker-backend does. The selector needs the bootstrap session cookie.
+		try {
+			const bootstrap = await fetch(initialUrl.toString(), {
+				method: 'GET',
+				headers: createZeldaBootstrapHeaders(gameWebToken, language),
+				redirect: 'manual'
+			});
+			for (const value of getSetCookies(bootstrap.headers))
+				cookieJar.addSetCookie(value, initialUrl);
+			await bootstrap.body?.cancel();
+			initialUrl.pathname = '/title-select';
+		} catch (cause) {
+			console.warn(
+				'[GameWebviewProxy] Zelda bootstrap failed',
+				cause instanceof Error ? cause.message : String(cause)
+			);
+		}
 	}
-	initialUrl.searchParams.set('lang', initialUrl.searchParams.get('lang') || language);
-	initialUrl.searchParams.set('na_lang', initialUrl.searchParams.get('na_lang') || language);
-	initialUrl.searchParams.set('na_country', initialUrl.searchParams.get('na_country') || country);
 
 	await db.delete(gameWebviewSessions).where(lt(gameWebviewSessions.expiresAt, new Date()));
 	await db.insert(gameWebviewSessions).values({
 		id,
 		nintendoAccountId: accountId,
 		serviceId: service.id,
-		serviceUri: initialUrl.toString(),
+		serviceUri,
 		allowedOrigins,
 		language,
 		country,
-		cookies: [],
+		cookies: cookieJar.toJSON(),
 		expiresAt
 	});
 
 	return {
 		sessionId: id,
-		webviewUrl: `/api/nso/webview/${id}/proxy?url=${encodeURIComponent(initialUrl.toString())}`,
+		webviewUrl:
+			isNookLink({ serviceId: service.id, serviceUri }) ||
+			isSplatNet2({ serviceId: service.id, serviceUri })
+				? gameWebviewLaunchPath(
+						initialUrl,
+						id,
+						isNookLink({ serviceId: service.id, serviceUri }) ? 'reef_nooklink' : undefined
+					)
+				: `/api/nso/webview/${id}/proxy?url=${encodeURIComponent(initialUrl.toString())}`,
 		expiresAt: expiresAt.getTime()
 	};
 }
@@ -109,7 +175,13 @@ export async function proxyGameWebviewRequest(
 	if (!session) return new Response('Game-service session expired.', { status: 401 });
 
 	const requestUrl = new URL(request.url);
-	const explicitUrl = restPath ? null : requestUrl.searchParams.get('url');
+	const browserService = isNookLink(session) || isSmashWorld(session) || isSplatNet2(session);
+	let explicitUrl = restPath && !browserService ? null : requestUrl.searchParams.get('url');
+	if (!explicitUrl && browserService) {
+		const originPath = restPath.match(/^__origin\/([^/]+)(\/.*)?$/);
+		if (originPath)
+			explicitUrl = `https://${decodeURIComponent(originPath[1])}${originPath[2] || '/'}${requestUrl.search}`;
+	}
 
 	let targetUrl: URL;
 
@@ -118,7 +190,7 @@ export async function proxyGameWebviewRequest(
 			targetUrl = new URL(explicitUrl.replace(/&amp;/gi, '&'));
 
 			for (const [name, value] of requestUrl.searchParams) {
-				if (name !== 'url') targetUrl.searchParams.set(name, value);
+				if (name !== 'url' && !browserService) targetUrl.searchParams.set(name, value);
 			}
 		} else {
 			const path = `/${restPath}`.replace(/\/{2,}/g, '/');
@@ -132,8 +204,25 @@ export async function proxyGameWebviewRequest(
 		return new Response('Invalid game-service URL.', { status: 400 });
 	}
 
-	if (!isAllowedServiceUrl(session, targetUrl, request.method)) {
+	if (
+		!isAllowedServiceUrl(
+			session,
+			targetUrl,
+			request.method,
+			request.headers.get('sec-fetch-dest') || ''
+		)
+	) {
 		return new Response('Game-service destination is not allowed.', { status: 403 });
+	}
+	if (isZeldaNotes(session) && targetUrl.pathname === '/') {
+		targetUrl.pathname = '/title-select';
+		return new Response(null, {
+			status: 302,
+			headers: {
+				location: `/api/nso/webview/${session.id}/proxy?url=${encodeURIComponent(targetUrl.toString())}`,
+				'cache-control': 'private, no-store'
+			}
+		});
 	}
 
 	const token = await db
@@ -156,7 +245,8 @@ export async function proxyGameWebviewRequest(
 		session,
 		targetUrl,
 		cookieJar,
-		token.token
+		token.token,
+		request.method
 	);
 	const body = ['GET', 'HEAD'].includes(request.method)
 		? undefined
@@ -181,37 +271,52 @@ export async function proxyGameWebviewRequest(
 		return new Response('Nintendo game service is unavailable.', { status: 502 });
 	}
 
-	if (isNookLink(session) && targetUrl.pathname.startsWith('/api/sd/v1/')) {
-		let serviceError: string | undefined;
-		try {
-			const payload = (await upstream.clone().json()) as {
-				error?: string;
-				error_message?: string;
-				message?: string;
-			};
-			serviceError =
-				payload.error_message || payload.error || (!upstream.ok ? payload.message : undefined);
-		} catch {
-			// Some successful NookLink endpoints do not return JSON.
-		}
-		const diagnostic = {
-			method: request.method,
-			path: targetUrl.pathname,
-			status: upstream.status,
-			hasGToken: cookieJar.getCookies().some((cookie) => cookie.name === '_gtoken'),
-			serviceError
-		};
-		if (!upstream.ok || serviceError) console.warn('[NookLinkApiError]', diagnostic);
-		else console.info('[NookLinkApi]', diagnostic);
-	}
-
 	await persistResponseCookies(session.id, targetUrl, upstream.headers);
 	const responseHeaders = createBrowserHeaders(upstream.headers);
+	if (browserService) {
+		responseHeaders.set(
+			'cache-control',
+			['GET', 'HEAD'].includes(request.method)
+				? gameAssetCacheControl(targetUrl, upstream)
+				: 'no-store'
+		);
+		for (const cookie of getSetCookies(upstream.headers)) {
+			const cleaned = cookie
+				.replace(/Domain=[^;]+;?/gi, '')
+				.replace(/SameSite=[^;]+;?/gi, '')
+				.replace(/Secure;?/gi, '')
+				.replace(/;+/g, ';')
+				.trim();
+			responseHeaders.append(
+				'set-cookie',
+				`${cleaned}; Secure; SameSite=None; Partitioned; Path=/`
+			);
+		}
+	}
+	if (
+		isSplatNet2(session) &&
+		targetUrl.pathname === '/' &&
+		request.method === 'GET' &&
+		!session.cookies.some((cookie) => cookie.name === 'iksm_session') &&
+		getSetCookies(upstream.headers).some((cookie) => cookie.startsWith('iksm_session=')) &&
+		!upstream.headers.has('location')
+	) {
+		await upstream.body?.cancel();
+		targetUrl.pathname = '/home';
+		responseHeaders.set(
+			'location',
+			`/api/nso/webview/${session.id}/proxy?url=${encodeURIComponent(targetUrl.toString())}`
+		);
+		responseHeaders.set('cache-control', 'no-store');
+		return new Response(null, { status: 302, headers: responseHeaders });
+	}
 	const location = upstream.headers.get('location');
 	if (location) {
 		try {
 			const redirect = new URL(location, targetUrl);
-			if (isAllowedServiceUrl(session, redirect, 'GET')) {
+			if (
+				isAllowedServiceUrl(session, redirect, 'GET', request.headers.get('sec-fetch-dest') || '')
+			) {
 				responseHeaders.set(
 					'location',
 					`/api/nso/webview/${session.id}/proxy?url=${encodeURIComponent(redirect.toString())}`
@@ -229,21 +334,33 @@ export async function proxyGameWebviewRequest(
 	}
 
 	const contentType = upstream.headers.get('content-type') || '';
+	const isJavascript =
+		/javascript|ecmascript|x-javascript/i.test(contentType) || /\.m?js$/i.test(targetUrl.pathname);
+	if (isJavascript && (isZeldaNotes(session) || isNookLink(session))) {
+		const source = await upstream.text();
+		const patched = isZeldaNotes(session)
+			? patchZeldaNotesJavascript(source)
+			: rewriteNookLinkApiOrigin(source);
+		responseHeaders.delete('etag');
+		responseHeaders.delete('last-modified');
+		return new Response(patched, { status: upstream.status, headers: responseHeaders });
+	}
 	if (/text\/html|application\/xhtml\+xml/i.test(contentType)) {
+		const source = await upstream.text();
 		const html = buildWebviewHtml({
 			sessionId: session.id,
 			serviceId: String(session.serviceId),
 			serviceUri: session.serviceUri,
 			currentTargetUrl: targetUrl.toString(),
 			allowedOrigins: session.allowedOrigins,
-			initialHtml: await upstream.text()
+			initialHtml: isNookLink(session) ? rewriteNookLinkApiOrigin(source) : source
 		});
 		responseHeaders.delete('etag');
 		responseHeaders.delete('last-modified');
 		return new Response(html, { status: upstream.status, headers: responseHeaders });
 	}
 
-	if (/text\/css/i.test(contentType)) {
+	if (!browserService && /text\/css/i.test(contentType)) {
 		const css = rewriteCss(await upstream.text(), session, targetUrl);
 		responseHeaders.delete('etag');
 		responseHeaders.delete('last-modified');
@@ -253,128 +370,47 @@ export async function proxyGameWebviewRequest(
 	return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
 }
 
-function createUpstreamHeaders(
-	incoming: Headers,
-	session: GameWebviewSession,
-	targetUrl: URL,
-	cookieJar: CookieJar,
-	token: string
-): Headers {
-	const headers = new Headers();
-	const incomingOrigin = incoming.get('origin');
-	const incomingReferer = incoming.get('referer');
-	for (const [name, value] of incoming) {
-		if (
-			[
-				'host',
-				'connection',
-				'content-length',
-				'cookie',
-				'accept-encoding',
-				'origin',
-				'referer',
-				'cf-connecting-ip',
-				'x-forwarded-for',
-				'x-forwarded-host',
-				'x-forwarded-proto'
-			].includes(name.toLowerCase())
-		) {
-			continue;
-		}
-		headers.set(name, value);
+/** Keep the same browser cache key across launches, with authentication on misses. */
+export async function serveStableGameAsset(
+	request: Request,
+	accountId: string,
+	sessionId: string
+): Promise<Response | null> {
+	const url = new URL(request.url);
+	if (!/^\/api\/nso\/webview-static\/\d+$/.test(url.pathname)) return null;
+	if (request.method !== 'GET')
+		return new Response('Method Not Allowed', {
+			status: 405,
+			headers: { Allow: 'GET', 'Cache-Control': 'no-store' }
+		});
+	let target: URL;
+	try {
+		target = new URL(url.searchParams.get('url') || '');
+	} catch {
+		return new Response('Invalid Nintendo static resource.', { status: 400 });
 	}
-
-	const isStatic = /\.(?:js|mjs|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm)$/i.test(
-		targetUrl.pathname
-	);
-	const cookies = cookieJar.getCookieHeader(targetUrl);
-	if (cookies) headers.set('cookie', cookies);
-
-	const cookieEntries = cookieJar.getCookies();
-	const isNook = isNookLink(session);
-	const isSmash = isSmashWorld(session);
-	const isZelda = ZELDA_NOTES_IDS.has(session.serviceId);
-	const hasGToken = cookieEntries.some((cookie) => cookie.name === '_gtoken');
-	const hasSmashSession = cookieEntries.some((cookie) =>
-		/(?:super_smash_session|session)/i.test(cookie.name)
-	);
-	const hasZeldaSession = cookieEntries.some((cookie) => /(?:a5_token|session)/i.test(cookie.name));
-	const initialNookDocument =
-		isNook &&
-		!hasGToken &&
-		targetUrl.origin === new URL(session.serviceUri).origin &&
-		!targetUrl.pathname.startsWith('/api/');
-
-	let attachGameToken: boolean;
-	if (session.serviceId === SPLATNET3_ID) {
-		attachGameToken =
-			targetUrl.pathname === '/api/bullet_tokens' || targetUrl.pathname === '/api/primer_tokens';
-	} else if (isNook) {
-		attachGameToken = initialNookDocument;
-	} else if (isZelda) {
-		attachGameToken = !hasZeldaSession && !isStatic;
-	} else if (isSmash) {
-		attachGameToken = !hasSmashSession && !isStatic;
-	} else {
-		attachGameToken = !isStatic;
-	}
-
-	if (attachGameToken) {
-		headers.set('x-gamewebtoken', token);
-	} else {
-		headers.delete('x-gamewebtoken');
-	}
-
-	const appVersion = env.CORAL_VERSION || '3.4.1';
-	const iosUa =
-		'Mozilla/5.0 (iPhone; CPU iPhone OS 15_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.3 Mobile/15E148 Safari/604.1';
-	const androidUa = `Mozilla/5.0 (Linux; Android 10; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120 Mobile Safari/537.36 com.nintendo.znca/${appVersion}`;
-	headers.set('user-agent', isNook || isSmash ? iosUa : androidUa);
-	if (isNook || isSmash) {
-		for (const name of [
-			'sec-ch-ua',
-			'sec-ch-ua-mobile',
-			'sec-ch-ua-platform',
-			'sec-ch-ua-platform-version',
-			'sec-ch-ua-arch',
-			'sec-ch-ua-bitness',
-			'sec-ch-ua-full-version',
-			'sec-ch-ua-full-version-list',
-			'sec-ch-ua-model'
-		]) {
-			headers.delete(name);
-		}
-	}
-	if (isNook) {
-		headers.delete('if-none-match');
-		headers.delete('if-modified-since');
-	}
-	headers.set('x-appplatform', 'android');
-	headers.set('x-appcolorscheme', 'DARK');
-	headers.set('x-requested-with', 'com.nintendo.znca');
-	headers.set('x-nacountry', session.country);
-	headers.set('accept-language', session.language);
-	const serviceOrigin = new URL(session.serviceUri).origin;
-	if (isNook || isSmash) {
-		if (incomingOrigin) headers.set('origin', serviceOrigin);
-		else headers.delete('origin');
-		if (incomingReferer) headers.set('referer', `${serviceOrigin}/`);
-		else headers.delete('referer');
-	} else {
-		headers.set('origin', targetUrl.origin);
-		headers.set('referer', `${targetUrl.origin}/`);
-	}
-	if (initialNookDocument) {
-		headers.delete('cookie');
-		headers.set('dnt', '0');
-		headers.set('x-isappanalyticsoptedin', 'false');
-	}
-	if (isSmash && !hasSmashSession) {
-		headers.delete('origin');
-		headers.delete('referer');
-		headers.set('upgrade-insecure-requests', '1');
-	}
-	return headers;
+	const kind = reusableGameAsset(target);
+	if (!kind) return new Response('Invalid Nintendo static resource.', { status: 400 });
+	const session = await getGameWebviewSession(accountId, sessionId);
+	if (!session)
+		return new Response('Game-service session authentication required.', { status: 401 });
+	url.pathname = `/api/nso/webview/${session.id}/proxy`;
+	url.search = '';
+	url.searchParams.set('url', target.toString());
+	const response = await proxyGameWebviewRequest(new Request(url, request), accountId, session.id);
+	const headers = new Headers(response.headers);
+	const type = headers.get('content-type') || '';
+	if (
+		response.ok &&
+		!headers.has('set-cookie') &&
+		(kind === 'script' ? /javascript|ecmascript/i.test(type) : type.startsWith('image/'))
+	) {
+		const immutable = immutableGameAsset(target);
+		const ttl = immutable ? 604800 : kind === 'script' ? 7200 : 86400;
+		headers.set('cache-control', `private, max-age=${ttl}${immutable ? ', immutable' : ''}`);
+		headers.delete('pragma');
+	} else headers.set('cache-control', 'no-store');
+	return new Response(response.body, { status: response.status, headers });
 }
 
 function createBrowserHeaders(upstream: Headers): Headers {
@@ -396,7 +432,7 @@ function createBrowserHeaders(upstream: Headers): Headers {
 		headers.append(name, value);
 	}
 	headers.set('cache-control', 'private, no-store');
-    headers.set('referrer-policy', 'same-origin');
+	headers.set('referrer-policy', 'same-origin');
 
 	return headers;
 }
@@ -433,50 +469,34 @@ function resolveAllowedOrigins(service: GameService): string[] {
 		if (isStrictNintendoUrl(new URL(`https://${checkHost}`))) values.add(`https://${host}`);
 	}
 	if (service.id === SPLATNET3_ID) values.add(SPLATNET3_API_ORIGIN);
-	if (service.id === NOOKLINK_ID) {
-		values.add(NOOKLINK_API_ORIGIN);
-		values.add(NOOKLINK_DPL_ORIGIN);
-	}
-	if (SMASH_WORLD_IDS.has(service.id)) {
-		values.add(SMASH_WORLD_CDN_ORIGIN);
-	}
 	return [...values];
 }
 
-function isAllowedServiceUrl(session: GameWebviewSession, target: URL, method: string): boolean {
+function isAllowedServiceUrl(
+	session: GameWebviewSession,
+	target: URL,
+	method: string,
+	fetchDest = ''
+): boolean {
 	if (!isStrictNintendoUrl(target)) return false;
 	if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) return false;
-	return session.allowedOrigins.some((entry) => {
-		const host = entry
-			.replace(/^https?:\/\//, '')
-			.split('/')[0]
-			.toLowerCase();
-		if (host.startsWith('*.')) {
-			const suffix = host.slice(2);
-			return target.hostname === suffix || target.hostname.endsWith(`.${suffix}`);
-		}
-		return target.hostname === host;
-	});
+	const whitelisted = isOriginWhitelisted(target.origin, session.allowedOrigins);
+	if (whitelisted) return true;
+	// Match the worker's exact sibling/CDN exceptions for resources. Coral's
+	// navigation whitelist is kept separate from these fetch/XHR destinations.
+	const isNavigation = ['document', 'iframe', 'frame'].includes(fetchDest.toLowerCase());
+	if (isNavigation) return false;
+	if (isSmashWorld(session) && target.origin === SMASH_WORLD_CDN_ORIGIN) {
+		return method === 'GET' || method === 'HEAD';
+	}
+	if (isNookLink(session) && [NOOKLINK_API_ORIGIN, NOOKLINK_DPL_ORIGIN].includes(target.origin)) {
+		return ['GET', 'HEAD', 'POST'].includes(method);
+	}
+	return false;
 }
 
 function isStrictNintendoUrl(value: URL): boolean {
-	if (value.protocol !== 'https:') return false;
-	const hostname = value.hostname.toLowerCase();
-	if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return false;
-	if (hostname === 'localhost' || hostname.endsWith('.local') || hostname.endsWith('.internal')) {
-		return false;
-	}
-	return TRUSTED_NINTENDO_DOMAINS.some(
-		(domain) => hostname === domain || hostname.endsWith(`.${domain}`)
-	);
-}
-
-function isNookLink(session: GameWebviewSession): boolean {
-	return session.serviceId === NOOKLINK_ID || session.serviceUri.includes('acbaa');
-}
-
-function isSmashWorld(session: GameWebviewSession): boolean {
-	return SMASH_WORLD_IDS.has(session.serviceId) || session.serviceUri.includes('smash');
+	return isStrictNintendoOrigin(value.toString());
 }
 
 async function persistResponseCookies(sessionId: string, targetUrl: URL, headers: Headers) {
@@ -512,86 +532,4 @@ function getSetCookies(headers: Headers): string[] {
 	if (values?.length) return values;
 	const value = headers.get('set-cookie');
 	return value ? [value] : [];
-}
-
-class CookieJar {
-	private cookies: WebviewCookie[];
-
-	constructor(cookies: WebviewCookie[]) {
-		this.cookies = [...cookies];
-	}
-
-	getCookies() {
-		this.removeExpired();
-		return [...this.cookies];
-	}
-
-	toJSON() {
-		this.removeExpired();
-		return this.cookies;
-	}
-
-	getCookieHeader(target: URL): string {
-		this.removeExpired();
-		return this.cookies
-			.filter((cookie) => {
-				if (cookie.secure && target.protocol !== 'https:') return false;
-				if (cookie.hostOnly) {
-					if (cookie.domain !== target.hostname) return false;
-				} else if (
-					target.hostname !== cookie.domain &&
-					!target.hostname.endsWith(`.${cookie.domain}`)
-				) {
-					return false;
-				}
-				return cookie.path === '/' || target.pathname.startsWith(cookie.path);
-			})
-			.sort((a, b) => b.path.length - a.path.length)
-			.map((cookie) => `${cookie.name}=${cookie.value}`)
-			.join('; ');
-	}
-
-	addSetCookie(raw: string, currentUrl: URL) {
-		const parts = raw.split(';').map((part) => part.trim());
-		const separator = parts[0]?.indexOf('=') ?? -1;
-		if (separator <= 0) return;
-		const name = parts[0].slice(0, separator);
-		const value = parts[0].slice(separator + 1);
-		let domain = currentUrl.hostname.toLowerCase();
-		let hostOnly = true;
-		let path = currentUrl.pathname.slice(0, currentUrl.pathname.lastIndexOf('/') + 1) || '/';
-		let secure = false;
-		let httpOnly = false;
-		let expires: number | undefined;
-
-		for (const part of parts.slice(1)) {
-			const [rawName, ...rawValue] = part.split('=');
-			const attribute = rawName.toLowerCase();
-			const attributeValue = rawValue.join('=');
-			if (attribute === 'domain' && attributeValue) {
-				const candidate = attributeValue.replace(/^\./, '').toLowerCase();
-				if (currentUrl.hostname === candidate || currentUrl.hostname.endsWith(`.${candidate}`)) {
-					domain = candidate;
-					hostOnly = false;
-				}
-			} else if (attribute === 'path' && attributeValue) path = attributeValue;
-			else if (attribute === 'secure') secure = true;
-			else if (attribute === 'httponly') httpOnly = true;
-			else if (attribute === 'max-age') expires = Date.now() + Number(attributeValue) * 1000;
-			else if (attribute === 'expires' && expires === undefined)
-				expires = Date.parse(attributeValue);
-		}
-
-		this.cookies = this.cookies.filter(
-			(cookie) => !(cookie.name === name && cookie.domain === domain && cookie.path === path)
-		);
-		if (!expires || expires > Date.now()) {
-			this.cookies.push({ name, value, domain, path, hostOnly, secure, httpOnly, expires });
-		}
-	}
-
-	private removeExpired() {
-		const now = Date.now();
-		this.cookies = this.cookies.filter((cookie) => !cookie.expires || cookie.expires > now);
-	}
 }

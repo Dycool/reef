@@ -9,6 +9,9 @@ import { eq } from 'drizzle-orm';
 import { redirect, type Handle } from '@sveltejs/kit';
 import { getCurrentPrivacyPolicy, hasAcceptedPrivacyPolicy } from '$lib/server/policy';
 import { isAdmin } from '$lib/server/admin';
+import { rootGameWebviewSession, rootGameWebviewProxyUrl } from '$lib/server/game-webview-routing';
+import { getGameWebviewSession, proxyGameWebviewRequest } from '$lib/server/game-webview';
+import { isNookLink, isSplatNet2 } from '$lib/server/game-service-compat';
 
 const WEBVIEW_REFERRER = /^\/api\/nso\/webview\/([0-9a-f-]{36})\/proxy(?:\/|$)/i;
 const POLICY_EXEMPT_PREFIXES = ['/accept-privacy', '/privacy', '/login'];
@@ -54,7 +57,30 @@ export const handle: Handle = sequence(Sentry.sentryHandle(), async ({ event, re
 		}
 	}
 
-	if (event.locals.nintendoAccount && !event.url.pathname.startsWith('/api/nso/webview/')) {
+	if (event.locals.nintendoAccount) {
+		const sessionId = rootGameWebviewSession(
+			event.url,
+			event.request.headers,
+			event.cookies.get('reef_game_webview')
+		);
+		if (sessionId) {
+			const session = await getGameWebviewSession(event.locals.nintendoAccount.id, sessionId);
+			if (session && (isNookLink(session) || isSplatNet2(session))) {
+				const proxyUrl = rootGameWebviewProxyUrl(event.url, session.serviceUri, session.id);
+				return proxyGameWebviewRequest(
+					new Request(proxyUrl, event.request),
+					event.locals.nintendoAccount.id,
+					session.id
+				);
+			}
+		}
+	}
+
+	if (
+		event.locals.nintendoAccount &&
+		!event.url.pathname.startsWith('/api/nso/webview/') &&
+		!event.url.pathname.startsWith('/api/nso/webview-static/')
+	) {
 		const referrer = event.request.headers.get('referer');
 		if (referrer) {
 			try {

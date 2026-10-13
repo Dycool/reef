@@ -5,7 +5,7 @@ import { createGameWebviewSession } from '$lib/server/game-webview';
 
 const SERVICE_ID = /^\d{1,16}$/;
 
-export const POST: RequestHandler = async ({ locals, params, request, url }) => {
+export const POST: RequestHandler = async ({ locals, params, request, url, cookies }) => {
 	if (!locals.nintendoAccount) throw error(401, 'Authentication required');
 
 	const origin = request.headers.get('origin');
@@ -23,7 +23,7 @@ export const POST: RequestHandler = async ({ locals, params, request, url }) => 
 	if (!service) throw error(404, 'Game service is not available for this account');
 
 	try {
-		await getGameWebServiceToken(
+		const gameToken = await getGameWebServiceToken(
 			locals.nintendoAccount,
 			serviceId,
 			requestBody.forceFresh === true
@@ -33,9 +33,17 @@ export const POST: RequestHandler = async ({ locals, params, request, url }) => 
 			locals.nintendoAccount.id,
 			service,
 			user?.language || 'en-GB',
-			user?.country || 'GB'
+			user?.country || 'GB',
+			gameToken.token
 		);
 
+		cookies.set('reef_game_webview', response.sessionId, {
+			path: '/',
+			httpOnly: true,
+			sameSite: 'lax',
+			secure: !['localhost', '127.0.0.1'].includes(url.hostname),
+			maxAge: 7200
+		});
 		return json(response, {
 			headers: {
 				'Cache-Control': 'private, no-store',

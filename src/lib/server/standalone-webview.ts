@@ -9,68 +9,9 @@ import {
 	NOOKLINK_DPL_ORIGIN,
 	SMASH_WORLD_CDN_ORIGIN,
 	SPLATNET3_API_ORIGIN,
-	TRUSTED_NINTENDO_DOMAINS
+	isOriginWhitelisted
 } from '$lib/server/webviewDomains';
-
-function isStrictNintendoOrigin(urlString: string): boolean {
-	if (!urlString || typeof urlString !== 'string') return false;
-	try {
-		const parsed = new URL(urlString);
-		if (parsed.protocol !== 'https:') return false;
-		const hostname = parsed.hostname.toLowerCase();
-
-		if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return false;
-		if (hostname.includes(':') || hostname.startsWith('[') || hostname.endsWith(']')) return false;
-		if (
-			hostname === 'localhost' ||
-			hostname.endsWith('.localhost') ||
-			hostname.endsWith('.local') ||
-			hostname.endsWith('.internal')
-		)
-			return false;
-
-		return TRUSTED_NINTENDO_DOMAINS.some(
-			(domain) => hostname === domain || hostname.endsWith(`.${domain}`)
-		);
-	} catch {
-		return false;
-	}
-}
-
-function isOriginWhitelisted(targetOrigin: string, allowedOrigins: string[]): boolean {
-	if (!isStrictNintendoOrigin(targetOrigin)) return false;
-	if (allowedOrigins.includes(targetOrigin)) return true;
-
-	try {
-		const targetHost = new URL(targetOrigin).hostname.toLowerCase();
-		for (const allowed of allowedOrigins) {
-			let allowedHost = '';
-			try {
-				allowedHost = allowed.startsWith('http')
-					? new URL(allowed).hostname.toLowerCase()
-					: allowed.toLowerCase();
-			} catch {
-				allowedHost = allowed.replace(/^https?:\/\//i, '').toLowerCase();
-			}
-
-			if (allowedHost.startsWith('*.')) {
-				const suffix = allowedHost.slice(2);
-				if (targetHost === suffix || targetHost.endsWith('.' + suffix)) {
-					return true;
-				}
-			} else if (allowedHost.startsWith('.')) {
-				const suffix = allowedHost.slice(1);
-				if (targetHost === suffix || targetHost.endsWith('.' + suffix)) {
-					return true;
-				}
-			}
-		}
-	} catch {
-		// Invalid origins are not eligible for proxying.
-	}
-
-	return false;
-}
+import { reusableGameAsset, stableGameAssetUrl } from './game-webview-assets';
 
 const SERVICE_QUIRKS_CSS: Record<string, string> = {
 	'4834290508791808': `
@@ -136,6 +77,17 @@ export function rewriteHtmlAssets(
 ): string {
 	const currentOrigin = new URL(currentTargetUrl).origin;
 	const proxyBase = `/api/nso/webview/${sessionId}/proxy`;
+	const cachedAssets =
+		isNookLinkService(serviceId, serviceUri) ||
+		isSmashWorldService(serviceId, serviceUri) ||
+		isSplatNet2Service(serviceId, serviceUri);
+	let directImages = false;
+	const escapeAttribute = (value: string) =>
+		value
+			.replace(/&/g, '&amp;')
+			.replace(/"/g, '&quot;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;');
 
 	function decodeHtmlEntities(value: string): string {
 		return value
@@ -218,29 +170,90 @@ export function rewriteHtmlAssets(
 			.join(', ');
 	}
 
-	return html.replace(/<(script|link|img|source|video|audio|form|a)\b[^>]*>/gi, (tag) => {
-		const out = tag.replace(
-			/\b(src|srcset|href|action|poster)=(["'])([^"']+)\2/gi,
-			(match, attr, quote, val) => {
-				const name = attr.toLowerCase();
-				if (
-					name === 'href' &&
-					(val.startsWith('#') ||
-						val.startsWith('javascript:') ||
-						val.startsWith('mailto:') ||
-						val.startsWith('tel:'))
-				) {
-					return match;
+	const rewritten = html.replace(
+		/<(script|link|img|source|video|audio|form|a)\b[^>]*>/gi,
+		(tag) => {
+			let fallback: string | undefined;
+			let out = tag.replace(
+				/\b(src|srcset|href|action|poster)=(["'])([^"']+)\2/gi,
+				(match, attr, quote, val) => {
+					const name = attr.toLowerCase();
+					if (
+						name === 'href' &&
+						(val.startsWith('#') ||
+							val.startsWith('javascript:') ||
+							val.startsWith('mailto:') ||
+							val.startsWith('tel:'))
+					) {
+						return match;
+					}
+					if (name === 'srcset') {
+						return cachedAssets ? match : `${attr}=${quote}${toBrowserSrcSet(val)}${quote}`;
+					}
+					if (
+						cachedAssets &&
+						!/^(?:data:|blob:|#|javascript:|mailto:|tel:|\/api\/nso\/webview)/i.test(val)
+					) {
+						try {
+							const target = new URL(decodeHtmlEntities(val), currentTargetUrl);
+							const kind = reusableGameAsset(target);
+							if (/^<script\b/i.test(tag) && name === 'src' && kind === 'script')
+								return `${attr}=${quote}${escapeAttribute(stableGameAssetUrl(target, serviceId))}${quote}`;
+							const image = /^<img\b/i.test(tag) && name === 'src';
+							const icon =
+								/^<link\b/i.test(tag) &&
+								name === 'href' &&
+								/rel=["'][^"']*(?:icon|apple-touch-icon)/i.test(tag);
+							if (
+								(image || icon) &&
+								target.protocol === 'https:' &&
+								/\.nintendo\.(?:net|com)$/.test(target.hostname)
+							) {
+								fallback =
+									kind === 'image'
+										? stableGameAssetUrl(target, serviceId)
+										: `${proxyBase}?url=${encodeURIComponent(target.toString())}`;
+								directImages = true;
+								return `${attr}=${quote}${escapeAttribute(target.toString())}${quote}`;
+							}
+						} catch {
+							/* Keep unsupported URLs unchanged. */
+						}
+					}
+					const browserUrl = toBrowserUrl(val);
+					return `${attr}=${quote}${cachedAssets ? escapeAttribute(browserUrl) : browserUrl}${quote}`;
 				}
-				if (name === 'srcset') {
-					return `${attr}=${quote}${toBrowserSrcSet(val)}${quote}`;
-				}
-				return `${attr}=${quote}${toBrowserUrl(val)}${quote}`;
-			}
-		);
+			);
 
-		return out;
-	});
+			if (fallback) {
+				const attr = /^<link\b/i.test(tag) ? 'href' : 'src';
+				out = out.replace(
+					/\s*\/?>(?=$)/,
+					(match) =>
+						` data-nso-proxy-fallback="${escapeAttribute(fallback!)}" data-nso-proxy-attr="${attr}"${/\bcrossorigin\s*=/i.test(out) ? '' : ' crossorigin="anonymous"'}${match}`
+				);
+			}
+			if (isZeldaNotesService(serviceId, serviceUri || currentTargetUrl) && /^<img\b/i.test(out)) {
+				out = out.replace(
+					/\sloading=(["'])lazy\1/gi,
+					(_match, quote) => ` loading=${quote}eager${quote}`
+				);
+			}
+			return out;
+		}
+	);
+	if (!directImages) return rewritten;
+	const fallbackScript = `<script id="nso-static-resource-fallback">
+window.addEventListener('error', event => {
+    const element = event.target;
+    if (!element?.dataset?.nsoProxyFallback || element.dataset.nsoProxyRetried === '1') return;
+    element.dataset.nsoProxyRetried = '1';
+    element[element.dataset.nsoProxyAttr] = element.dataset.nsoProxyFallback;
+}, true);
+</script>`;
+	return /<head[^>]*>/i.test(rewritten)
+		? rewritten.replace(/<head[^>]*>/i, (match) => match + fallbackScript)
+		: fallbackScript + rewritten;
 }
 
 export function generateBridgeSnippet(
@@ -265,6 +278,51 @@ const currentUpstreamOrigin = ${jsonOrigin};
 const currentUpstreamUrl = ${jsonTargetUrl};
 const allowedOrigins = ${jsonAllowedOrigins};
 const proxyBase = '/api/nso/webview/' + sessionId + '/proxy';
+
+if (${isZeldaNotesService(serviceId, currentTargetUrl) ? 'true' : 'false'}) {
+    // Zelda's animated map repeatedly reads Canvas2D pixels with getImageData().
+    // Tell Chromium up front that these contexts are readback-heavy instead of
+    // letting it emit the willReadFrequently performance warning mid-animation.
+    try {
+        const nativeCanvasGetContext = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function(type, options) {
+            if (String(type || '').toLowerCase() === '2d') {
+                const nextOptions = options && typeof options === 'object'
+                    ? Object.assign({}, options, { willReadFrequently: true })
+                    : { willReadFrequently: true };
+                return nativeCanvasGetContext.call(this, type, nextOptions);
+            }
+            return nativeCanvasGetContext.call(this, type, options);
+        };
+    } catch(e) {}
+
+    // Dynamic Zelda images can also opt into lazy loading after hydration.
+    // Keep the behavior consistent with the HTML rewrite above.
+    try {
+        const loadingDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'loading');
+        if (loadingDescriptor && loadingDescriptor.get && loadingDescriptor.set) {
+            Object.defineProperty(HTMLImageElement.prototype, 'loading', {
+                configurable: true,
+                enumerable: loadingDescriptor.enumerable,
+                get: function() { return loadingDescriptor.get.call(this); },
+                set: function(value) {
+                    const normalized = String(value || '').toLowerCase() === 'lazy' ? 'eager' : value;
+                    return loadingDescriptor.set.call(this, normalized);
+                }
+            });
+        }
+
+        const nativeSetAttribute = Element.prototype.setAttribute;
+        Element.prototype.setAttribute = function(name, value) {
+            if (this instanceof HTMLImageElement && String(name).toLowerCase() === 'loading' && String(value).toLowerCase() === 'lazy') {
+                return nativeSetAttribute.call(this, name, 'eager');
+            }
+            return nativeSetAttribute.call(this, name, value);
+        };
+    } catch(e) {}
+}
+
+
 
 if (${isSmashWorldService(serviceId, currentTargetUrl) || isNookLinkService(serviceId, currentTargetUrl) ? 'true' : 'false'}) {
     const NXAPI_WEBSERVICE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.3 Mobile/15E148 Safari/604.1';
@@ -308,7 +366,7 @@ if (${isSmashWorldService(serviceId, currentTargetUrl) || isNookLinkService(serv
 if (${isSmashWorldService(serviceId, currentTargetUrl) ? 'true' : 'false'}) {
     try {
         if (window.history && window.history.replaceState) {
-            window.history.replaceState(null, '', proxyBase + '?url=' + encodeURIComponent(currentUpstreamOrigin + '/'));
+            window.history.replaceState(null, '', '/');
         }
     } catch(e) {}
 
@@ -349,6 +407,37 @@ if (${isSmashWorldService(serviceId, currentTargetUrl) ? 'true' : 'false'}) {
             return origSetAttribute.call(this, name, val);
         };
     } catch(e) {}
+}
+
+if (${isSmashWorldService(serviceId, currentTargetUrl) || isNookLinkService(serviceId, currentTargetUrl) ? 'true' : 'false'}) {
+    // Nintendo registers observation-only touchstart handlers as non-passive. Upgrade
+    // only handlers that do not call preventDefault(), preserving cancellable touch
+    // behavior while avoiding Chromium's scroll-blocking violation warning.
+    try {
+        const nativeAddEventListener = EventTarget.prototype.addEventListener;
+        EventTarget.prototype.addEventListener = function(type, listener, options) {
+            if (String(type || '').toLowerCase() === 'touchstart') {
+                let callsPreventDefault = false;
+                try {
+                    const candidate = typeof listener === 'function'
+                        ? listener
+                        : (listener && typeof listener.handleEvent === 'function' ? listener.handleEvent : null);
+                    const source = candidate ? Function.prototype.toString.call(candidate) : '';
+                    callsPreventDefault = source.includes('preventDefault');
+                } catch(e) {}
+
+                if (!callsPreventDefault) {
+                    if (options == null || typeof options === 'boolean') {
+                        options = { capture: options === true, passive: true };
+                    } else if (typeof options === 'object' && options.passive !== true) {
+                        options = Object.assign({}, options, { passive: true });
+                    }
+                }
+            }
+            return nativeAddEventListener.call(this, type, listener, options);
+        };
+    } catch(e) {}
+
 }
 
 function isAllowedClientOrigin(origin) {
@@ -412,6 +501,13 @@ function toProxiedUrl(rawUrl) {
             parsed = new URL(decodedUrl, currentUpstreamUrl);
         }
 
+        // Smash constructs URLs from the browser-visible origin. Map them back
+        // to the upstream page before proxying, including Request/URL inputs.
+        if (${isSmashWorldService(serviceId, currentTargetUrl) ? 'true' : 'false'} && parsed.origin === location.origin) {
+            if (parsed.pathname.startsWith(proxyBase)) return parsed.toString();
+            parsed = new URL(parsed.pathname + parsed.search + parsed.hash, currentUpstreamOrigin);
+        }
+
         if (${isNookLinkService(serviceId, currentTargetUrl) ? 'true' : 'false'} &&
             /^\\/api\\/sd\\/v1(?:\\/|$)/.test(parsed.pathname) &&
             (parsed.origin === location.origin ||
@@ -455,6 +551,7 @@ function toProxiedSrcSet(value) {
     }).join(', ');
 }
 
+if (${!(isSmashWorldService(serviceId, currentTargetUrl) || isNookLinkService(serviceId, currentTargetUrl) || isSplatNet2Service(serviceId, currentTargetUrl)) ? 'true' : 'false'}) {
 try {
     const origSetAttributeResources = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function(name, val) {
@@ -513,11 +610,60 @@ try {
     }
 } catch(e) {}
 
+}
+
+// These games load optional analytics and embedded videos. Keep their bridge
+// callbacks available when tracking is blocked, and align video embed origins.
+const IS_BROWSER_SERVICE = ${isSmashWorldService(serviceId, currentTargetUrl) || isNookLinkService(serviceId, currentTargetUrl) || isSplatNet2Service(serviceId, currentTargetUrl) ? 'true' : 'false'};
+function isTrackingUrl(value) {
+    if (!IS_BROWSER_SERVICE || !value) return false;
+    try { return /google-analytics\\.com|doubleclick\\.net|googletagmanager\\.com|googleads/i.test(new URL(String(value), location.href).hostname); }
+    catch(e) { return false; }
+}
+if (IS_BROWSER_SERVICE) {
+    window.ga = window.ga || function() { (window.ga.q = window.ga.q || []).push(arguments); };
+    window.ga.l = +new Date;
+    window.gtag = window.gtag || function() { (window.dataLayer = window.dataLayer || []).push(arguments); };
+    function compatibleResourceUrl(value, video) {
+        let url = String(value || '');
+        if (!video && isTrackingUrl(url)) return 'data:text/javascript;charset=utf-8,window.ga=window.ga||function(){};window.gtag=window.gtag||function(){};';
+        if (video && /youtube(?:-nocookie)?\\.com\\/embed\\//.test(url)) {
+            try {
+                const parsed = new URL(url, location.href);
+                if (parsed.searchParams.has('origin')) parsed.searchParams.set('origin', location.origin);
+                url = parsed.toString();
+            } catch(e) {}
+        }
+        return url;
+    }
+    for (const proto of [HTMLScriptElement.prototype, HTMLIFrameElement.prototype]) {
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'src');
+        if (!descriptor?.set) continue;
+        Object.defineProperty(proto, 'src', {
+            configurable: true, enumerable: descriptor.enumerable,
+            get() { return descriptor.get ? descriptor.get.call(this) : this.getAttribute('src'); },
+            set(value) { return descriptor.set.call(this, compatibleResourceUrl(value, proto === HTMLIFrameElement.prototype)); }
+        });
+    }
+    const nativeSetAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+        if (String(name).toLowerCase() === 'src' && (this instanceof HTMLScriptElement || this instanceof HTMLIFrameElement))
+            value = compatibleResourceUrl(value, this instanceof HTMLIFrameElement);
+        return nativeSetAttribute.call(this, name, value);
+    };
+    const nativePostMessage = Window.prototype.postMessage;
+    Window.prototype.postMessage = function(...args) {
+        try { return nativePostMessage.apply(this, args); }
+        catch(e) { if (e?.name !== 'SecurityError' && !String(e?.message).includes('target origin provided')) throw e; }
+    };
+}
+
 const nativeFetch = window.fetch.bind(window);
 window.fetch = (input, init) => {
     try {
-        if (typeof input === 'string') {
-            return nativeFetch(toProxiedUrl(input), init);
+        if (isTrackingUrl(input instanceof Request ? input.url : input)) return Promise.resolve(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        if (typeof input === 'string' || input instanceof URL) {
+            return nativeFetch(toProxiedUrl(String(input)), init);
         } else if (input instanceof Request) {
             return nativeFetch(new Request(toProxiedUrl(input.url), input), init);
         }
@@ -528,11 +674,25 @@ window.fetch = (input, init) => {
 const nativeXhrOpen = XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open = function(method, url, ...rest) {
     try {
+        this._isTracking = isTrackingUrl(url);
         return nativeXhrOpen.call(this, method, toProxiedUrl(String(url)), ...rest);
     } catch(e) {
         return nativeXhrOpen.call(this, method, url, ...rest);
     }
 };
+
+if (IS_BROWSER_SERVICE) {
+    const nativeXhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(...args) {
+        if (!this._isTracking) return nativeXhrSend.apply(this, args);
+        for (const [name, value] of Object.entries({ status: 200, responseText: '{}', readyState: 4 }))
+            Object.defineProperty(this, name, { value, writable: true, configurable: true });
+        setTimeout(() => {
+            this.onreadystatechange?.(new Event('readystatechange'));
+            this.onload?.(new ProgressEvent('load'));
+        }, 0);
+    };
+}
 
 let requestCounter = 0;
 const pendingCallbacks = new Map();
@@ -1387,7 +1547,7 @@ export function buildWebviewHtml(options: WebviewHtmlOptions): string {
 
 	const source =
 		initialHtml !== undefined && initialHtml !== null && initialHtml.length > 0
-			? initialHtml.replace(/<!--[\s\S]*?-->/g, '')
+			? initialHtml
 			: MINIMAL_SHELL;
 
 	const rewritten = rewriteHtmlAssets(
