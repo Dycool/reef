@@ -757,30 +757,21 @@ function getTournamentManagerExternalUrl(rawUrl) {
     return null;
 }
 
+let lastTournamentOpenTime = 0;
 function openTournamentManagerOutsideWebView(source) {
     if (!IS_SPLATNET3_WEBVIEW) return null;
 
-    let opened = null;
-    try {
-        if (nativeWindowOpen) {
-            opened = nativeWindowOpen(
-                TOURNAMENT_MANAGER_BROWSER_URL,
-                '_blank',
-                'noopener,noreferrer'
-            );
-            if (opened) {
-                try { opened.opener = null; } catch(e) {}
-            }
-        }
-    } catch(e) {}
-
-    if (!opened) {
-        postBridgeMessage('NSO_OPEN_EXTERNAL_BROWSER', {
-            url: TOURNAMENT_MANAGER_BROWSER_URL
-        });
+    const now = Date.now();
+    if (now - lastTournamentOpenTime < 1500) {
+        return null;
     }
+    lastTournamentOpenTime = now;
 
-    return opened;
+    postBridgeMessage('NSO_OPEN_EXTERNAL_BROWSER', {
+        url: TOURNAMENT_MANAGER_BROWSER_URL
+    });
+
+    return true;
 }
 
 if (IS_SPLATNET3_WEBVIEW) {

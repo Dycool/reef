@@ -239,7 +239,12 @@
 		loadingTimer = undefined;
 	}
 
+	let lastExternalOpenTime = 0;
 	function openExternalUrl(value: string) {
+		const now = Date.now();
+		if (now - lastExternalOpenTime < 1500) return;
+		lastExternalOpenTime = now;
+
 		try {
 			const url = new URL(value);
 			if (url.protocol === 'https:' || url.protocol === 'http:') {
