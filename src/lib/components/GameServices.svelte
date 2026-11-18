@@ -378,7 +378,8 @@
 					src={frameUrl}
 					title={activeService.name}
 					class="size-full border-0 bg-black"
-					allow="screen-wake-lock"
+					allow="fullscreen; screen-wake-lock"
+					allowfullscreen
 					onload={frameLoaded}
 				></iframe>
 			{/if}
