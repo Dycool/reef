@@ -28,6 +28,7 @@ import {
 	createSplatNet2BootstrapHeaders
 } from './game-webview-headers';
 import { CookieJar } from './webview-cookie-jar';
+import { rewriteHlsPlaylist } from './rewrite-hls-playlist';
 import { gameWebviewLaunchPath } from './game-webview-routing';
 import {
 	gameAssetCacheControl,
@@ -334,6 +335,25 @@ export async function proxyGameWebviewRequest(
 	}
 
 	const contentType = upstream.headers.get('content-type') || '';
+	const isHlsManifest =
+		/(?:vnd\.apple\.mpegurl|(?:audio|application)\/x-mpegurl)/i.test(contentType) ||
+		/\.m3u8?$/i.test(targetUrl.pathname);
+	if (isZeldaNotes(session) && request.method === 'GET' && upstream.status === 200 && isHlsManifest) {
+		const manifest = await upstream.text();
+		const rewritten = manifest.trimStart().startsWith('#EXTM3U')
+			? rewriteHlsPlaylist(manifest, targetUrl, session.id, (target) =>
+					isAllowedServiceUrl(session, target, 'GET', 'video')
+				)
+			: manifest;
+		if (rewritten !== manifest) {
+			for (const name of ['etag', 'last-modified', 'content-md5', 'accept-ranges']) {
+				responseHeaders.delete(name);
+			}
+		}
+		// HLS manifests may change during playback; never cache rewritten versions.
+		responseHeaders.set('cache-control', 'no-store');
+		return new Response(rewritten, { status: upstream.status, headers: responseHeaders });
+	}
 	const isJavascript =
 		/javascript|ecmascript|x-javascript/i.test(contentType) || /\.m?js$/i.test(targetUrl.pathname);
 	if (isJavascript && (isZeldaNotes(session) || isNookLink(session))) {
