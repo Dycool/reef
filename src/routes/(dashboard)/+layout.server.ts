@@ -24,6 +24,7 @@ import {
 import type { VisibleSystemBotInfo } from '$lib/types/settings';
 import type { CoralSvelteNotice, Notification } from '$lib/types/notifications';
 import { isAdmin } from '$lib/server/admin';
+import { hasSystemBotCapacity } from '$lib/server/utils/NintendoAuth';
 
 function parseStoredTimestamp(value: number | string): Date {
 	return new Date(typeof value === 'number' ? value * 1000 : value);
@@ -66,7 +67,7 @@ export const load = (async ({ locals, depends, isDataRequest, url }) => {
 				};
 			})
 		)
-	);
+    );
 
 	const registeredPasskeys = await db
 		.select({
@@ -93,11 +94,14 @@ export const load = (async ({ locals, depends, isDataRequest, url }) => {
 		.where(eq(discordLinks.nintendoAccountId, locals.nintendoAccount.id))
 		.get();
 
+	const systemBotCapacityAvailable =
+		linkedDiscordAccount == null ? await hasSystemBotCapacity(locals.nintendoAccount) : true;
+
 	const presenceSession = linkedDiscordAccount
 		? await db
 				.select({
 					id: presenceSessions.id,
-					enabled: presenceSessions.enabled,
+					presenceMode: presenceSessions.presenceMode,
 					presence: presenceSessions.presence,
 					activity: presenceSessions.activity,
 					publishedAt: presenceSessions.publishedAt,
@@ -105,9 +109,9 @@ export const load = (async ({ locals, depends, isDataRequest, url }) => {
 					lastSyncedAt: presenceSessions.lastSyncedAt,
 					platform: presenceSessions.platform,
 					splatnetEnabled: presenceSessions.splatnetEnabled,
-					showWhenInactive: presenceSessions.showWhenInactive,
-					showEShopButton: presenceSessions.showEShopButton,
-					showFriendCodeButton: presenceSessions.showFriendCodeButton,
+					eShopButton: presenceSessions.eShopButton,
+					friendButton: presenceSessions.friendButton,
+					showPlaytime: presenceSessions.showPlaytime,
 					publishFailures: presenceSessions.publishFailures,
 					lastPublishError: presenceSessions.lastPublishError,
 					needsReauth: presenceSessions.needsReauth
@@ -222,9 +226,13 @@ export const load = (async ({ locals, depends, isDataRequest, url }) => {
 		? (DISCORD_LINK_ERROR_MESSAGES[discordErrorCode] ?? DISCORD_LINK_ERROR_MESSAGES.unassigned)
 		: null;
 
+	const currentUserPermissions = locals.nintendoAccount.currentUserPermissions;
+
 	return {
 		...deferredData,
-		signupBlocked: locals.nintendoAccount.botFriendshipBlocked ?? false,
+		signupBlocked:
+			(locals.nintendoAccount.botFriendshipBlocked ?? false) &&
+			locals.nintendoAccount.botFriendshipBlockedReason !== 'no-capacity',
 		signupBlockedReason: locals.nintendoAccount.botFriendshipBlockedReason ?? null,
 		passkeys: registeredPasskeys,
 		discordLink: linkedDiscordAccount,
@@ -235,8 +243,17 @@ export const load = (async ({ locals, depends, isDataRequest, url }) => {
 		allowAssets: locals.nintendoAccount.accessNintendoAssets,
 		isAdmin: admin,
 		adminSettings,
-		userPermissions: locals.nintendoAccount.currentUserPermissions,
+		userPermissions:
+			currentUserPermissions == null
+				? null
+				: {
+						coral: currentUserPermissions,
+						reef: {
+							allowDiscordUsernameSearching: locals.nintendoAccount.allowDiscordUsernameSearching
+						}
+					},
 		discordEnrolmentEnabled,
+		systemBotCapacityAvailable,
 		discordLinkError
 	};
 }) satisfies LayoutServerLoad;

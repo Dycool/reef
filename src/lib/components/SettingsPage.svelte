@@ -27,6 +27,7 @@
 		discordInviteLink = 'https://discord.gg/bmCyVeF6Vw',
 		userPermissions,
 		discordEnrolmentsEnabled,
+		systemBotCapacityAvailable,
 		discordLinkError = null
 	}: {
 		passkeys: PasskeySummary[];
@@ -39,10 +40,19 @@
 		discordInviteLink?: string;
 		userPermissions?: UserPermissionsSummary | null;
 		discordEnrolmentsEnabled: boolean;
+		systemBotCapacityAvailable?: boolean;
 		discordLinkError?: string | null;
 	} = $props();
 
-	const supporters: string[] = ['Azteea', 'mia', 'Kiarocki', 'Dycool', 'FloGamer64', 'NakuKoro', 'nekeo'];
+	const supporters: string[] = [
+		'Azteea',
+		'mia',
+		'Kiarocki',
+		'Dycool',
+		'FloGamer64',
+		'NakuKoro',
+		'nekeo'
+	];
 </script>
 
 <div class="w-full py-8 sm:py-10">
@@ -59,6 +69,7 @@
 			{visibleSystemBotInfo}
 			{userPermissions}
 			{discordEnrolmentsEnabled}
+			{systemBotCapacityAvailable}
 			{discordLinkError}
 		/>
 		<PrivacySettings {userPermissions} />
@@ -87,6 +98,8 @@
 			<a href="https://bsky.app/profile/dootsky.re" target="_blank" class="link link-primary"
 				>Bluesky</a
 			>.
+			<br /><br />
+			And Ellie (alongside other nxapi contributors) for nxapi and nxapi-auth! Without her hard work none of this would be possible
 			<br /><br />
 			And of course, thanks to my
 			<a href="https://github.com/sponsors/bentheminernz" target="_blank" class="link"
