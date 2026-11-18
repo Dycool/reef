@@ -1,6 +1,6 @@
 import { isStrictNintendoOrigin } from './webviewDomains';
 
-const CACHE_VERSION = '20260817-v1';
+const CACHE_VERSION = '20261117-inline-video-v2';
 
 function hashedAsset(target: URL): boolean {
 	return /(?:^|[._-])[a-f0-9]{8,}(?:[._-]|$)/i.test(target.pathname.split('/').pop() || '');

@@ -1,4 +1,5 @@
 import { NOOKLINK_API_ORIGIN } from './webviewDomains';
+import { patchZeldaNotesInlineVideo } from './patch-zelda-video-inline';
 
 export interface ServiceIdentity {
 	serviceId: number;
@@ -76,5 +77,5 @@ export function patchZeldaNotesJavascript(jsText: string): string {
 		);
 	}
 
-	return jsText;
+	return patchZeldaNotesInlineVideo(jsText);
 }
